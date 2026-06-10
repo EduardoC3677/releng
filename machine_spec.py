@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import os
 import platform
 import re
 import subprocess
@@ -22,6 +23,14 @@ class MachineSpec:
         os = detect_os()
         arch = detect_arch()
         config = None
+
+        # Termux runs natively on Android (Bionic libc) but platform.system()
+        # reports "linux". Detect it so we build a real Android binary using
+        # Termux's own clang instead of trying to cross-compile with an NDK.
+        if os == "linux" and detect_termux():
+            os = "android"
+            config = "termux"
+            return MachineSpec(os, arch, config)
 
         if os == "linux":
             try:
@@ -237,6 +246,20 @@ def detect_os() -> str:
     if os == "darwin":
         os = "macos"
     return os
+
+
+def detect_termux() -> bool:
+    """Return True when running inside Termux on Android.
+
+    Termux sets TERMUX_VERSION / PREFIX under /data/data/com.termux and ships
+    its own Bionic-linked clang, so a native build is possible without an NDK.
+    """
+    if os.environ.get("TERMUX_VERSION"):
+        return True
+    prefix = os.environ.get("PREFIX", "")
+    if "com.termux" in prefix:
+        return True
+    return os.path.isdir("/data/data/com.termux/files/usr")
 
 
 def detect_arch() -> str:

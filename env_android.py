@@ -1,6 +1,8 @@
 from configparser import ConfigParser
+import os
 from pathlib import Path
 import shlex
+import shutil
 from typing import Callable, Dict, List, Optional
 
 from .machine_file import strv_to_meson
@@ -19,6 +21,13 @@ def init_machine_config(machine: MachineSpec,
                         outenv: Dict[str, str],
                         outdir: Path,
                         apple_min_os: Optional[Dict[str, str]] = None):
+    # Native Termux build: we are already running on Android (Bionic) and have
+    # a working clang in $PREFIX/bin, so skip the NDK cross-compile machinery
+    # entirely and just configure Termux's own toolchain.
+    if machine.config == "termux" and not is_cross_build:
+        _init_termux_native_config(machine, environ, config, outpath, outenv)
+        return
+
     ndk_found = False
     try:
         ndk_root = Path(environ["ANDROID_NDK_ROOT"])
@@ -106,6 +115,95 @@ def init_machine_config(machine: MachineSpec,
     options["c_link_args"] = "linker_flags"
     options["cpp_link_args"] = "linker_flags + cxx_link_flags"
     options["b_lundef"] = "true"
+
+
+def _init_termux_native_config(machine: MachineSpec,
+                               environ: Dict[str, str],
+                               config: ConfigParser,
+                               outpath: List[str],
+                               outenv: Dict[str, str]):
+    """Configure a native build inside Termux.
+
+    Termux ships a Bionic-linked LLVM toolchain in $PREFIX/bin, so we simply
+    point Meson at it -- no NDK, no -target, no sysroot juggling. Binaries
+    produced this way run directly on the Android device.
+    """
+    prefix = environ.get("PREFIX", "/data/data/com.termux/files/usr")
+    prefix_path = Path(prefix)
+    bindir = prefix_path / "bin"
+
+    def tool(name: str) -> str:
+        p = bindir / name
+        if p.exists():
+            return str(p)
+        found = shutil.which(name)
+        return found if found is not None else str(p)
+
+    binaries = config["binaries"]
+
+    read_envflags = lambda name: shlex.split(environ.get(name, ""))
+
+    # Resolve compilers honouring user overrides (CC/CXX), defaulting to clang.
+    cc = read_envflags("CC") or [tool("clang")]
+    cxx = read_envflags("CXX") or [tool("clang++")]
+
+    binaries["c"] = strv_to_meson(cc) + " + common_flags"
+    binaries["cpp"] = strv_to_meson(cxx) + " + common_flags"
+    binaries["ar"] = strv_to_meson([tool("llvm-ar")])
+    binaries["nm"] = strv_to_meson([tool("llvm-nm")])
+    binaries["ranlib"] = strv_to_meson([tool("llvm-ranlib")])
+    binaries["strip"] = strv_to_meson([tool("llvm-strip"), "--strip-all"])
+    binaries["readelf"] = strv_to_meson([tool("llvm-readelf")])
+    binaries["objcopy"] = strv_to_meson([tool("llvm-objcopy")])
+    binaries["objdump"] = strv_to_meson([tool("llvm-objdump")])
+
+    common_flags = []
+    common_flags += ARCH_COMMON_FLAGS.get(machine.arch, [])
+
+    c_like_flags = [
+        "-DANDROID",
+        "-D__TERMUX__",
+        "-ffunction-sections",
+        "-fdata-sections",
+        # Termux installs headers/libs under $PREFIX; make sure they win.
+        "-isystem", str(prefix_path / "include"),
+    ]
+    c_like_flags += ARCH_C_LIKE_FLAGS.get(machine.arch, [])
+    c_like_flags += read_envflags("CPPFLAGS")
+
+    cxx_like_flags = []
+    # Termux clang already links the system libc++ (shared); do NOT force
+    # -static-libstdc++ as the NDK path does -- the static variant is absent.
+    cxx_link_flags = []
+
+    linker_flags = [
+        "-L" + str(prefix_path / "lib"),
+        "-Wl,-rpath," + str(prefix_path / "lib"),
+        "-Wl,-z,relro",
+        "-Wl,-z,noexecstack",
+        "-Wl,--gc-sections",
+    ]
+    linker_flags += ARCH_LINKER_FLAGS.get(machine.arch, [])
+    linker_flags += read_envflags("LDFLAGS")
+
+    constants = config["constants"]
+    constants["common_flags"] = strv_to_meson(common_flags)
+    constants["c_like_flags"] = strv_to_meson(c_like_flags)
+    constants["linker_flags"] = strv_to_meson(linker_flags)
+    constants["cxx_like_flags"] = strv_to_meson(cxx_like_flags)
+    constants["cxx_link_flags"] = strv_to_meson(cxx_link_flags)
+
+    options = config["built-in options"]
+    options["c_args"] = "c_like_flags + " + strv_to_meson(read_envflags("CFLAGS"))
+    options["cpp_args"] = "c_like_flags + cxx_like_flags + " + strv_to_meson(read_envflags("CXXFLAGS"))
+    options["c_link_args"] = "linker_flags"
+    options["cpp_link_args"] = "linker_flags + cxx_link_flags"
+    # Termux toolchain cannot resolve every symbol at link time for some
+    # shared objects (it links against Bionic); keep it lenient like FreeBSD.
+    options["b_lundef"] = "false"
+
+    # Make sure Termux's bin dir is on PATH for any auxiliary tools.
+    outpath.append(str(bindir))
 
 
 def _needs_patched_fstream(machine: MachineSpec, android_api: int) -> bool:
